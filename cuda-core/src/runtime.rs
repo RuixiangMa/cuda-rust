@@ -587,8 +587,8 @@ unsafe impl Sync for Stream {}
 ///
 /// Owned RAII: the driver handle is destroyed on drop (the driver defers
 /// destruction of an event still captured in unfinished work, so dropping
-/// early is safe). An event is bound to its device at construction;
-/// recording it on a stream of another device is rejected.
+/// early is safe). An event is bound to its CUDA context at construction;
+/// recording it on a stream from another context is rejected.
 pub struct Event {
     cu_event: cuda_bindings::CUevent,
     device: Arc<Device>,
@@ -597,19 +597,28 @@ pub struct Event {
 unsafe impl Send for Event {}
 unsafe impl Sync for Event {}
 
+fn validate_event_context(
+    event_context: cuda_bindings::CUcontext,
+    stream_context: cuda_bindings::CUcontext,
+) -> Result<(), DriverError> {
+    if event_context == stream_context {
+        Ok(())
+    } else {
+        Err(DriverError(
+            cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+        ))
+    }
+}
+
 impl Event {
     /// Records this event on `stream`.
     ///
-    /// Errors with `CUDA_ERROR_INVALID_VALUE` if the stream belongs to a
-    /// different device than the one this event was created on.
+    /// Errors with CUDA_ERROR_INVALID_HANDLE if the stream belongs to a
+    /// different CUDA context than the one this event was created on.
     pub fn record(&self, stream: &Arc<Stream>) -> Result<(), DriverError> {
-        if stream.device().ordinal() != self.device.ordinal() {
-            return Err(DriverError(
-                cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-            ));
-        }
+        validate_event_context(self.device.cu_ctx, stream.device().cu_ctx())?;
         // Safety: both handles are valid by construction (RAII wrappers),
-        // and the same-device check above pins them to one context.
+        // and the same-context check above pins them to one context.
         unsafe { crate::cudarc_shim::event::record(self.cu_event, stream.cu_stream()) }
     }
 
@@ -792,7 +801,7 @@ impl Stream {
     /// cross-stream dependency primitive: record an event on the producing
     /// stream, then have the consuming stream wait on it.
     ///
-    /// Errors with `CUDA_ERROR_INVALID_VALUE` if the event belongs to a
+    /// Errors with CUDA_ERROR_INVALID_VALUE if the event belongs to a
     /// different device than this stream.
     pub fn wait_event(&self, event: &Event) -> Result<(), DriverError> {
         if event.device.ordinal() != self.device.ordinal() {
@@ -800,8 +809,9 @@ impl Stream {
                 cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
             ));
         }
-        // Safety: both handles are valid by construction (RAII wrappers),
-        // and the same-device check above pins them to one context.
+        // Safety: both handles are valid by construction. CUDA permits waiting
+        // on an event from another context; the device check enforces this
+        // method's same-device contract.
         unsafe {
             stream::wait_event(
                 self.cu_stream,
@@ -1050,6 +1060,20 @@ mod tests {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn event_record_context_check_validates_context_handles() {
+        let context_a = 1usize as cuda_bindings::CUcontext;
+        let context_b = 2usize as cuda_bindings::CUcontext;
+
+        assert_eq!(validate_event_context(context_a, context_a), Ok(()));
+        assert_eq!(
+            validate_event_context(context_a, context_b),
+            Err(DriverError(
+                cuda_bindings::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+            ))
+        );
     }
 
     #[test]
